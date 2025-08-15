@@ -1,1 +1,1 @@
-email_checker_bot.py
+worker: python email_checker_bot.py
