@@ -1,55 +1,66 @@
 # -*- coding: utf-8 -*-
 import os, re, asyncio, random, string, logging, functools
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 
 import aiosmtplib
 import dns.resolver
-from aiosmtplib import SMTPConnectError, SMTPHeloError, SMTPRecipientRefused, SMTPException
+from aiosmtplib import SMTPConnectError, SMTPHeloError, SMTPException
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------------- Configuration ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# ----------------- Configuration & Logging -----------------
+class Config:
+    """Centralized configuration for the bot."""
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+    # It's better to get PROBE_DOMAIN from an environment variable
+    # to avoid hardcoding it and use a real domain for better trust.
+    PROBE_DOMAIN = os.getenv("PROBE_DOMAIN", "verifier.example.com").strip()
+    CONNECT_TIMEOUT = 8
+    SMTP_TIMEOUT = 12
+    PORTS = (587, 25, 465)
+    MAX_MX = 3
+    PARALLEL_PROBES = 4
 
-# Hardcoded parameters
-CONNECT_TIMEOUT = 8
-SMTP_TIMEOUT = 12
-PORTS = (587, 25, 465)      # Try multiple ports
-MAX_MX = 3                  # Max 3 MX records to check
-PARALLEL = 4                # Max parallel probes
-PROBE_DOMAIN = "verifier.example.com" # Use a real domain you control for better trust
-
-# ---------------- Logging Setup ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("email-check-bot")
 
-# ---------------- Helpers ----------------
+# --------- Stable DNS Resolver ---------
+# Using a fixed, reliable DNS resolver avoids potential issues
+# with the system's default resolver inside a container.
+_resolver = dns.resolver.Resolver(configure=False)
+_resolver.nameservers = ["1.1.1.1", "1.0.0.1"]
+dns_resolve = _resolver.resolve
+
+# ----------------- Utilities -----------------
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 def lines(text: str) -> List[str]:
+    """Splits a multi-line string into a list of cleaned, non-empty lines."""
     return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
 
 def rand_local() -> str:
+    """Generates a random local part for a probe email address."""
     return "probe-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
 
 def classify(code: int) -> str:
+    """Classifies an SMTP response code into a human-readable category."""
     if code in (250, 251): return "ok"
     if code in (550, 551, 552, 553, 554): return "dead"
     if code in (450, 451, 452, 421): return "temp"
     return "unknown"
 
 def banner_hint(banner: str) -> Optional[str]:
+    """Analyzes the SMTP banner to guess the service provider."""
     b = (banner or "").lower()
-    if "outlook" in b or "protection.outlook.com" in b or "microsoft" in b:
-        return "ms"
-    if "google.com" in b or "gmail" in b or "google" in b:
-        return "google"
+    if "outlook" in b or "protection.outlook.com" in b or "microsoft" in b: return "ms"
+    if "google.com" in b or "gmail" in b or "google" in b: return "google"
     if "proofpoint" in b: return "proofpoint"
     if "mimecast" in b: return "mimecast"
     return None
 
 def verdict_label(kind: str) -> str:
+    """Returns a user-friendly label for a verification result."""
     return {
         "ok": "شغّال ✅",
         "dead": "غير شغّال ❌",
@@ -65,7 +76,7 @@ def verdict_label(kind: str) -> str:
 def cached_mx_lookup(domain: str) -> List[Tuple[int, str]]:
     """Cached DNS MX lookup to avoid repeated queries."""
     try:
-        ans = dns.resolver.resolve(domain, "MX")
+        ans = dns_resolve(domain, "MX")
         mx = []
         for r in ans:
             try:
@@ -77,184 +88,173 @@ def cached_mx_lookup(domain: str) -> List[Tuple[int, str]]:
     except Exception:
         # Fallback to A record if no MX is found
         try:
-            dns.resolver.resolve(domain, "A")
+            dns_resolve(domain, "A")
             return [(50, domain)]
         except Exception:
             return []
 
-# ---------------- SMTP Probe ----------------
-async def smtp_probe(host: str, port: int, email: str, helo_name: str) -> Tuple[str, str]:
-    """
-    Probes an SMTP server to verify an email address.
-    Returns (kind, brief_reason).
-    """
-    use_tls = (port == 465)
-    client = None
-    try:
-        # Establish a connection
-        client = aiosmtplib.SMTP(
-            hostname=host,
-            port=port,
-            timeout=SMTP_TIMEOUT,
-            use_tls=use_tls,
-        )
+# ----------------- Verifier Core -----------------
+class EmailVerifier:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
 
-        banner = await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
-        hint = banner_hint(banner or "")
-
-        # Initial EHLO/HELO
+    async def _smtp_probe(self, host: str, port: int, email: str) -> Tuple[str, str]:
+        """Performs a single SMTP probe to a mail server."""
+        client = None
         try:
-            await asyncio.wait_for(client.ehlo(helo_name), timeout=SMTP_TIMEOUT)
-        except (SMTPHeloError, asyncio.TimeoutError):
+            client = aiosmtplib.SMTP(
+                hostname=host,
+                port=port,
+                timeout=self.cfg.SMTP_TIMEOUT,
+                use_tls=(port == 465),
+            )
+            await asyncio.wait_for(client.connect(), timeout=self.cfg.CONNECT_TIMEOUT)
+            hint = banner_hint(client.server_greeting or "")
+            
+            # EHLO/HELO
             try:
-                await asyncio.wait_for(client.helo(helo_name), timeout=SMTP_TIMEOUT)
-            except Exception:
-                return ("lock" if hint in ("ms", "mimecast", "proofpoint") else "unknown",
-                        "HELO/EHLO Rejected")
+                await asyncio.wait_for(client.ehlo(self.cfg.PROBE_DOMAIN), timeout=self.cfg.SMTP_TIMEOUT)
+            except (SMTPHeloError, asyncio.TimeoutError):
+                await asyncio.wait_for(client.helo(self.cfg.PROBE_DOMAIN), timeout=self.cfg.SMTP_TIMEOUT)
 
-        # Handle STARTTLS for port 587
-        if port == 587:
-            try:
-                await asyncio.wait_for(client.starttls(), timeout=SMTP_TIMEOUT)
-                await asyncio.wait_for(client.ehlo(helo_name), timeout=SMTP_TIMEOUT)
-            except Exception:
-                return ("lock" if hint else "unknown", "STARTTLS Rejected")
+            # STARTTLS on port 587
+            if port == 587:
+                await client.starttls()
+                await client.ehlo(self.cfg.PROBE_DOMAIN)
 
-        # MAIL FROM command
-        mail_from = f"{rand_local()}@{helo_name}"
-        try:
-            code_mail, _ = await asyncio.wait_for(client.mail(mail_from), timeout=SMTP_TIMEOUT)
-            if code_mail >= 500:
-                return ("lock" if hint else "unknown", f"MAIL FROM {code_mail}")
-        except (SMTPRecipientRefused, asyncio.TimeoutError):
-            return ("lock" if hint else "unknown", "MAIL FROM Rejected")
+            # MAIL FROM
+            await client.mail(f"{rand_local()}@{self.cfg.PROBE_DOMAIN}")
 
-        # Real RCPT command
-        code_real, _ = await asyncio.wait_for(client.rcpt(email), timeout=SMTP_TIMEOUT)
-        res_real = classify(code_real)
+            # Real RCPT
+            code_real, _ = await client.rcpt(email)
+            res_real = classify(code_real)
 
-        # Probe for catch-all
-        domain = email.split("@", 1)[-1]
-        fake_rcpt = f"{rand_local()}@{domain}"
-        code_fake, _ = await asyncio.wait_for(client.rcpt(fake_rcpt), timeout=SMTP_TIMEOUT)
-        res_fake = classify(code_fake)
+            # Catch-all probe
+            domain = email.split("@", 1)[-1]
+            code_fake, _ = await client.rcpt(f"{rand_local()}@{domain}")
+            res_fake = classify(code_fake)
 
-        # Final decision logic
-        if res_real == "ok" and res_fake == "ok":
-            return "catch", "Server accepts any address"
-        if res_real == "ok" and res_fake != "ok":
-            return "ok", f"RCPT {code_real}"
-        if res_real == "dead":
-            return "dead", f"RCPT {code_real}"
-        if res_real == "temp":
-            return "temp", f"RCPT {code_real}"
+            if res_real == "ok" and res_fake == "ok":
+                return "catch", "Accepts any address"
+            if res_real == "ok":
+                return "ok", f"RCPT {code_real}"
+            if res_real == "dead":
+                return "dead", f"RCPT {code_real}"
+            if res_real == "temp":
+                return "temp", f"RCPT {code_real}"
 
-        if hint in ("ms", "google", "mimecast", "proofpoint"):
-            return "lock", f"Policy {hint}"
+            if hint in ("ms", "google", "mimecast", "proofpoint"):
+                return "lock", f"Policy {hint}"
 
-        return "unknown", f"RCPT {code_real}"
+            return "unknown", f"RCPT {code_real}"
 
-    except SMTPConnectError:
-        return "temp", "Connection Refused/Timeout"
-    except asyncio.TimeoutError:
-        return "temp", "Connection Timeout"
-    except Exception as e:
-        return "unknown", f"Exception {e.__class__.__name__}"
-    finally:
-        # Ensure client disconnects gracefully
-        if client and client.is_connected:
-            try:
+        except SMTPConnectError:
+            return "temp", "Connect Refused/Timeout"
+        except asyncio.TimeoutError:
+            return "temp", "Timeout"
+        except SMTPException as e:
+            return "unknown", f"SMTP Error: {type(e).__name__}"
+        except Exception as e:
+            return "unknown", f"Unexpected Error: {type(e).__name__}"
+        finally:
+            if client and client.is_connected:
                 await client.quit()
-            except Exception:
-                pass
 
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("Error: BOT_TOKEN is not set.")
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # ---------------- Telegram Handlers ----------------
-    WELCOME = (
-        "أهلًا! أرسل قائمة إيميلات (كل إيميل في سطر) وسأرجّع:\n"
-        "✅ شغّال | ❌ غير شغّال | 🔒 يرفض التحقق | ⏳ مؤقت | 🎯 Catch-all | ⚠️ غير مؤكد\n\n"
-        "مثال:\n"
-        "user@gmail.com\n"
-        "not-exist@nope-domain-xyz.com\n"
-        "info@yourdomain.com"
-    )
-
-    async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(WELCOME)
-
-    async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(WELCOME)
-
-    async def verify_one(email: str) -> Tuple[str, str]:
+    async def verify(self, email: str) -> Tuple[str, str]:
+        """Main verification method that orchestrates the probes."""
         if not EMAIL_RE.match(email):
             return verdict_label("syntax"), "Invalid format"
+
         domain = email.split("@", 1)[-1]
-        
-        mx = await asyncio.get_running_loop().run_in_executor(None, cached_mx_lookup, domain)
-        if not mx:
+        mx_records = await asyncio.get_running_loop().run_in_executor(None, cached_mx_lookup, domain)
+        if not mx_records:
             return verdict_label("domain"), "No MX/A record"
 
-        targets = []
-        for _, host in mx[:MAX_MX]:
-            for p in PORTS:
-                targets.append((host, p))
+        tasks = []
+        for _, host in mx_records[:self.cfg.MAX_MX]:
+            for p in self.cfg.PORTS:
+                tasks.append(asyncio.create_task(self._smtp_probe(host, p, email)))
+
+        decisive_kinds = {"ok", "dead", "catch", "lock"}
+        soft_results = []
         
-        sem = asyncio.Semaphore(PARALLEL)
-        result_queue = asyncio.Queue()
+        for task in asyncio.as_completed(tasks):
+            try:
+                kind, why = await task
+                if kind in decisive_kinds:
+                    # Cancel any remaining tasks once a decisive result is found
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    return verdict_label(kind), why
+                else:
+                    soft_results.append(f"{kind}:{why}")
+            except asyncio.CancelledError:
+                pass
 
-        decisive = {"ok", "dead", "catch", "lock"}
-        soft_map = []
-
-        async def worker(host, port):
-            async with sem:
-                kind, why = await smtp_probe(host, port, email, PROBE_DOMAIN)
-                await result_queue.put((host, port, kind, why))
-
-        tasks = [asyncio.create_task(worker(h, p)) for h, p in targets]
-
-        decided: Optional[Tuple[str, str]] = None
-        for _ in range(len(tasks)):
-            host, port, kind, why = await result_queue.get()
-            if kind in decisive and decided is None:
-                decided = (verdict_label(kind), f"{host}:{port} {why}")
-                for t in tasks:
-                    t.cancel()
-                break
-            elif kind in ("temp", "unknown"):
-                soft_map.append(f"{host}:{port} {why}")
-
-        for t in tasks:
-            try: await t
-            except asyncio.CancelledError: pass
-            except Exception: pass
-
-        if decided:
-            return decided
-        if soft_map:
-            return verdict_label("unknown"), " / ".join(soft_map[:3])
+        if soft_results:
+            return verdict_label("unknown"), " / ".join(soft_results[:3])
+        
         return verdict_label("unknown"), "Undetermined"
 
-    async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (update.message.text or "").strip()
-        targets = lines(text)[:25]
-        if not targets:
-            return
-        
-        msg = await update.message.reply_text("جاري التحقق… ⏳")
-        
-        out_lines = []
-        for i, em in enumerate(targets):
-            await msg.edit_text(f"جاري التحقق من {em} ({i+1}/{len(targets)})...")
-            status, reason = await verify_one(em)
-            out_lines.append(f"{em} — {status}")
-        
-        await msg.edit_text("\n".join(out_lines))
 
+# ----------------- Telegram Handlers -----------------
+CFG = Config()
+VERIFIER = EmailVerifier(CFG)
+
+WELCOME_MESSAGE = (
+    "أهلًا! أرسل قائمة إيميلات (كل إيميل في سطر) وسأرجّع:\n"
+    "✅ شغّال | ❌ غير شغّال | 🔒 يرفض التحقق | ⏳ مؤقت | 🎯 Catch-all | ⚠️ غير مؤكد\n\n"
+    "مثال:\nuser@gmail.com\nnot-exist@nope-domain-xyz.com\ninfo@yourdomain.com"
+)
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME_MESSAGE)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME_MESSAGE)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    emails = lines(text)[:25]
+    if not emails:
+        return
+
+    msg = await update.message.reply_text("جاري التحقق… ⏳")
+    results = []
+    total = len(emails)
+
+    for i, email in enumerate(emails, 1):
+        progress_bar = "▇" * (i * 10 // total) + " " * (10 - (i * 10 // total))
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                text=f"جاري التحقق… ⏳\n`[{progress_bar}]` {i}/{total} - {email}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass  # Ignore edit failures to avoid bot crashes
+
+        status, _ = await VERIFIER.verify(email)
+        results.append(f"{email} — {status}")
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            text="\n".join(results),
+        )
+    except Exception:
+        # Fallback to sending a new message if editing fails
+        await update.message.reply_text("\n".join(results))
+
+# ----------------- Main Entry Point -----------------
+def main():
+    if not CFG.BOT_TOKEN:
+        raise SystemExit("Error: BOT_TOKEN is not set in environment variables.")
+    app = Application.builder().token(CFG.BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
