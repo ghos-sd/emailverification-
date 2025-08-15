@@ -1,238 +1,197 @@
 # -*- coding: utf-8 -*-
-import os
-import re
-import asyncio
-import random
-import string
+import os, re, asyncio, random, string, logging
 from typing import List, Tuple, Optional
 
 import aiosmtplib
-import dns.asyncresolver
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
-)
+import dns.resolver
 
-# ========= إعدادات عامة =========
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+# ---------- إعدادات ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("email-check-bot")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# الإيميل/الدومين الذي سنستخدمه في MAIL FROM خلال اختبار SMTP
-# لا يحتاج أن يكون حقيقيًا ما دمنا لا نُسلّم الرسالة.
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "check@verifier.example")
-SENDER_DOMAIN = SENDER_EMAIL.split("@")[-1] if "@" in SENDER_EMAIL else "verifier.example"
+# مهلات واتصالات
+CONNECT_TIMEOUT = 8
+SMTP_TIMEOUT = 12
+PORTS = (587, 25, 465)
 
-# مهلات الشبكة
-DNS_TIMEOUT = float(os.getenv("DNS_TIMEOUT", "6.0"))
-SMTP_CONNECT_TIMEOUT = float(os.getenv("SMTP_CONNECT_TIMEOUT", "12.0"))
-SMTP_TOTAL_TIMEOUT = float(os.getenv("SMTP_TOTAL_TIMEOUT", "18.0"))
+# ---------- أدوات ----------
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
-HELP = (
-    "أهلًا! أرسل قائمة إيميلات (كل إيميل في سطر) وسأتحقق لك:\n"
-    "✅ شغال — ❌ غير شغال — ⚠️ Catch-all — ⏳ مهلة — 🔒 رفض الاتصال — 🧩 صيغة غير صالحة\n\n"
+def normalize_lines(text: str) -> List[str]:
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    return [ln for ln in lines if ln]
+
+async def dns_mx(domain: str) -> List[Tuple[int, str]]:
+    """يرجع [(priority, host), ...] أو []"""
+    try:
+        answers = dns.resolver.resolve(domain, "MX")
+        pairs = []
+        for r in answers:
+            try:
+                pairs.append((int(r.preference), str(r.exchange).rstrip(".")))
+            except Exception:
+                continue
+        pairs.sort(key=lambda x: x[0])
+        return pairs
+    except Exception as e:
+        log.debug("MX lookup failed for %s: %s", domain, e)
+        # fallback: جرّب A كملقم بريد
+        try:
+            dns.resolver.resolve(domain, "A")
+            return [(50, domain)]
+        except Exception:
+            return []
+
+def rand_local() -> str:
+    return "probe-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+
+def classify_smtp_code(code: int, message: str) -> str:
+    """يصنف كود SMTP إلى نتيجة عربية مختصرة."""
+    if code in (250, 251):
+        return "ok"  # شغّال
+    if code in (550, 551, 552, 553, 554):
+        return "dead"  # غير شغّال
+    if code in (450, 451, 452, 421):
+        return "temp"  # مؤقت/غير مؤكد
+    # أي شيء غامض
+    return "unknown"
+
+async def smtp_probe(host: str, port: int, email: str, helo_name: str) -> Tuple[str, str]:
+    """
+    يرجع (result, reason)
+    result ∈ {"ok", "dead", "temp", "unknown", "conn_refused"}
+    """
+    use_tls = (port == 465)
+    try:
+        client = aiosmtplib.SMTP(
+            hostname=host,
+            port=port,
+            timeout=CONNECT_TIMEOUT if use_tls else SMTP_TIMEOUT,
+            use_tls=use_tls,
+            start_tls=(port == 587),
+            tls_context=None,
+        )
+        await client.connect()
+        try:
+            await client.ehlo(helo_name)
+        except Exception:
+            # بعض السيرفرات تتقبل HELO فقط
+            try:
+                await client.helo(helo_name)
+            except Exception:
+                await client.quit()
+                return "unknown", "لم يرد على HELO/EHLO"
+
+        # من الأفضل MAIL FROM عنوان بسيط غير حقيقي
+        mail_from = f"{rand_local()}@{helo_name}"
+        code, msg = await client.mail(mail_from)
+        if code >= 400:
+            await client.quit()
+            return "unknown", f"MAIL_FROM {code}"
+
+        # RCPT الحقيقي
+        code_rcpt, msg_rcpt = await client.rcpt(email)
+        cls = classify_smtp_code(code_rcpt, msg_rcpt.decode() if isinstance(msg_rcpt, bytes) else str(msg_rcpt))
+
+        # محاولة اكتشاف catch-all: جرّب عنوان عشوائي بنفس الدومين
+        domain = email.split("@", 1)[-1]
+        fake_rcpt = f"{rand_local()}@{domain}"
+        code_fake, msg_fake = await client.rcpt(fake_rcpt)
+        cls_fake = classify_smtp_code(code_fake, msg_fake.decode() if isinstance(msg_fake, bytes) else str(msg_fake))
+
+        await client.quit()
+
+        # إذا الاثنين OK -> catch-all
+        if cls in ("ok",) and cls_fake in ("ok",):
+            return "unknown", "Catch-all (السيرفر يقبل أي عنوان)"
+        return cls, f"RCPT {code_rcpt}"
+
+    except aiosmtplib.errors.SMTPConnectError as e:
+        return "conn_refused", "رفض الاتصال"
+    except asyncio.TimeoutError:
+        return "conn_refused", "مهلة اتصال"
+    except Exception as e:
+        return "unknown", f"استثناء: {e.__class__.__name__}"
+
+async def verify_email(email: str) -> Tuple[str, str]:
+    """
+    يرجع (تصنيف عربي, سبب مختصر)
+    التصنيفات: "شغّال ✅" / "غير شغّال ❌" / "غير مؤكد ⚠️" / "صيغة غير صحيحة ❌" / "دومين غير صالح ❌"
+    """
+    if not EMAIL_RE.match(email):
+        return "صيغة غير صحيحة ❌", "صيغة الإيميل"
+
+    domain = email.split("@", 1)[-1]
+    mx_list = await asyncio.get_event_loop().run_in_executor(None, dns_mx, domain)
+    if not mx_list:
+        return "دومين غير صالح ❌", "لا سجلات MX/A"
+
+    helo_name = "validator.local"
+    # جرّب أكثر من MX وأكثر من بورت حتى نصل لنتيجة واضحة
+    uncertain_reasons = []
+    for _, host in mx_list[:3]:  # خليك خفيف
+        for port in PORTS:
+            result, reason = await smtp_probe(host, port, email, helo_name)
+            if result == "ok":
+                return "شغّال ✅", f"{host}:{port} {reason}"
+            if result == "dead":
+                return "غير شغّال ❌", f"{host}:{port} {reason}"
+            if result in ("temp", "unknown", "conn_refused"):
+                uncertain_reasons.append(f"{host}:{port} {reason}")
+
+    # لو مافي نتيجة قاطعة
+    return "غير مؤكد ⚠️", " / ".join(uncertain_reasons[:3]) or "غير محدد"
+
+# ---------- Telegram ----------
+WELCOME = (
+    "أهلًا! أرسل قائمة إيميلات (كل إيميل في سطر) وسأتحقق:\n"
+    "✅ شغّال / ❌ غير شغّال / ⚠️ غير مؤكد / ❌ غير مؤكد صيغة/دومين\n\n"
     "مثال:\n"
     "user@gmail.com\n"
     "not-exist@nope-domain-xyz.com\n"
     "info@yourdomain.com"
 )
 
-EMAIL_RE = re.compile(
-    r"^(?P<local>[-!#$%&'*+/0-9=?A-Z^_`a-z{|}~.]+)@(?P<domain>[A-Za-z0-9.-]+\.[A-Za-z]{2,})$"
-)
-
-def is_valid_format(email: str) -> bool:
-    return bool(EMAIL_RE.match(email.strip()))
-
-def split_lines(text: str) -> List[str]:
-    return [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-async def resolve_mx(domain: str) -> List[Tuple[int, str]]:
-    """يرجع [(priority, host), ...] مرتبًا بالأولوية."""
-    resolver = dns.asyncresolver.Resolver()
-    resolver.lifetime = DNS_TIMEOUT
-    try:
-        ans = await resolver.resolve(domain, "MX")
-        out = []
-        for r in ans:
-            # r.exchange هو اسم السيرفر بنقطة في النهاية.
-            host = str(r.exchange).rstrip(".")
-            out.append((int(r.preference), host))
-        out.sort(key=lambda x: x[0])
-        return out
-    except Exception:
-        return []
-
-def random_localpart(n: int = 10) -> str:
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(n))
-
-async def smtp_handshake(
-    mx_host: str, recipient: str, helo_domain: str
-) -> Tuple[Optional[int], Optional[str]]:
-    """
-    يرجع (code, message) من خطوة RCPT TO.
-    code قد يكون 250/251 قبول، أو 550/551/5xx رفض.
-    """
-    try:
-        client = aiosmtplib.SMTP(
-            hostname=mx_host,
-            port=25,
-            timeout=SMTP_CONNECT_TIMEOUT,
-            use_tls=False,
-            start_tls=True,  # جرّب STARTTLS إن كان متاحًا
-        )
-        await asyncio.wait_for(client.connect(), timeout=SMTP_CONNECT_TIMEOUT)
-        # بعض السيرفرات تطلب EHLO/HELO
-        await client.ehlo(helo_domain)
-        try:
-            await client.starttls()
-            await client.ehlo(helo_domain)
-        except aiosmtplib.errors.SMTPException:
-            # لو السيرفر لا يدعم STARTTLS، نُكمل عادي
-            pass
-
-        await client.mail(SENDER_EMAIL)
-        code, msg = await client.rcpt(recipient)
-        await client.quit()
-        # msg قد يكون bytes أو str حسب الخادم
-        if isinstance(msg, bytes):
-            msg = msg.decode("utf-8", "ignore")
-        return code, (msg or "")
-    except asyncio.TimeoutError:
-        return None, "timeout"
-    except aiosmtplib.errors.SMTPException as e:
-        # أخطاء SMTP نفسها (رفض مبكر، إلخ)
-        # قد تحتوي على code
-        code = getattr(e, "code", None)
-        return code, str(e)
-    except Exception as e:
-        return None, f"conn_error: {e}"
-
-async def detect_catch_all(mx_host: str, domain: str) -> bool:
-    """
-    نختبر عنوانًا عشوائيًا غير موجود على نفس الدومين:
-    إذا قَبِله السيرفر، غالبًا الدومين Catch-all.
-    """
-    fake_rcpt = f"{random_localpart()}@{domain}"
-    code, _ = await smtp_handshake(mx_host, fake_rcpt, SENDER_DOMAIN)
-    # قبول 250/251 يعني احتمال كبير Catch-all
-    return code in (250, 251)
-
-def classify(code: Optional[int], msg: Optional[str]) -> str:
-    """
-    يحوّل أكواد SMTP/الرسالة إلى تصنيف مفهوم.
-    """
-    if code is None and msg == "timeout":
-        return "⏳ مهلة"
-    if code is None and msg and msg.startswith("conn_error"):
-        return "🔒 رفض الاتصال"
-
-    if code in (250, 251):
-        return "✅ شغال"
-
-    # أشهر أكواد الرفض
-    if code and (500 <= code < 600):
-        return "❌ غير شغال"
-
-    # fallback عام
-    return "❌ غير شغال"
-
-async def verify_single(email: str) -> str:
-    """
-    يتحقق من إيميل واحد ويُرجع سطر نتيجة: "<email> — <status>"
-    """
-    if not is_valid_format(email):
-        return f"{email} — 🧩 صيغة غير صالحة"
-
-    m = EMAIL_RE.match(email)
-    domain = m.group("domain") if m else email.split("@")[-1]
-
-    # حل MX
-    mx_list = await resolve_mx(domain)
-    if not mx_list:
-        return f"{email} — ❌ دومين بلا MX"
-
-    last_status = "🔒 رفض الاتصال"
-    catch_all_flag = False
-
-    # جرّب أكثر من MX حتى نصل لنتيجة واضحة
-    for _, mx in mx_list[:3]:  # يكفي أول 3 خوادم
-        # اكتشاف catch-all (مرة واحدة تكفي)
-        if not catch_all_flag:
-            try:
-                catch_all_flag = await detect_catch_all(mx, domain)
-            except Exception:
-                pass
-
-        code, msg = await smtp_handshake(mx, email, SENDER_DOMAIN)
-        status = classify(code, msg)
-
-        # لو شغال ✅ أو غير شغال ❌ — خلاص نرجع النتيجة
-        if status in ("✅ شغال", "❌ غير شغال"):
-            # لو الدومين Catch-all ننبه
-            if catch_all_flag and status == "✅ شغال":
-                return f"{email} — ⚠️ Catch-all (قد يقبل أي عنوان)"
-            return f"{email} — {status}"
-
-        last_status = status  # حفظ آخر وضع (مهلة/رفض اتصال)
-        # وإلا نجرب MX آخر…
-
-    # لو ما حصلنا نتيجة قاطعة:
-    if catch_all_flag:
-        return f"{email} — ⚠️ Catch-all (قد يقبل أي عنوان)"
-    return f"{email} — {last_status}"
-
-# ========= Telegram =========
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+    await update.message.reply_text(WELCOME)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+    await update.message.reply_text(WELCOME)
 
-async def verify_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    emails = split_lines(text)
+    emails = normalize_lines(text)
     if not emails:
-        await update.message.reply_text("أرسل إيميلات (كل إيميل في سطر).")
         return
+    # حد أقصى عشان ما نتخطى مهلة تيليجرام
+    emails = emails[:20]
 
-    # تحديد حد معقول للدفعة
-    if len(emails) > 50:
-        await update.message.reply_text("الحد الأقصى في دفعة واحدة هو 50 إيميل.")
-        return
+    await update.message.reply_text("جاري التحقق… ⏳")
 
-    await update.message.reply_text("⏳ جاري التحقق…")
+    results = []
+    for em in emails:
+        try:
+            status, why = await verify_email(em)
+        except Exception as e:
+            log.exception("verify failed")
+            status, why = "غير مؤكد ⚠️", f"استثناء: {e.__class__.__name__}"
+        results.append(f"{em} — {status}")
 
-    # نتحقق بالتوازي لكن بدون إرهاق الشبكة (سِماح 8 مهام متزامنة)
-    sem = asyncio.Semaphore(8)
-    results: List[str] = []
-
-    async def run_one(addr: str):
-        async with sem:
-            try:
-                r = await asyncio.wait_for(verify_single(addr), timeout=SMTP_TOTAL_TIMEOUT + 6)
-            except asyncio.TimeoutError:
-                r = f"{addr} — ⏳ مهلة"
-            results.append(r)
-
-    tasks = [asyncio.create_task(run_one(e)) for e in emails]
-    await asyncio.gather(*tasks)
-
-    # حافظ على ترتيب الإدخال
-    order = {e: i for i, e in enumerate(emails)}
-    results.sort(key=lambda s: order.get(s.split(" — ")[0], 0))
-    out = "\n".join(results)
-    await update.message.reply_text(out)
+    await update.message.reply_text("\n".join(results))
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Set BOT_TOKEN env var.")
-
+        raise SystemExit("ضع BOT_TOKEN في المتغيرات.")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, verify_handler))
-
-    print("Email verifier bot running…")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    log.info("Email checker bot running…")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
